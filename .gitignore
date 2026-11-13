@@ -12,6 +12,10 @@ runs/
 *.pt
 *.npy
 
+# ---- Logs and notes (.txt), but keep requirements.txt
+*.txt
+!requirements.txt
+
 # ---- Python
 __pycache__/
 *.pyc
