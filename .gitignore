@@ -1,0 +1,26 @@
+# ---- Data: never commit (10 GB, and CC BY-NC-SA licensed, not ours to redistribute)
+Dataset/
+*.h5
+*.zip
+*.crdownload
+
+# ---- Generated data: rebuilt by code/prepare_fan_data.py
+data_unfolded/
+
+# ---- Training runs and checkpoints (large; keep summaries elsewhere)
+runs/
+*.pt
+*.npy
+
+# ---- Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ---- Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -1,0 +1,7 @@
+subject,arm,centroid_spread_max_pair_mm,centroid_spread_mean_to_centre_mm,test_coverage_mean_pct,test_coverage_min_pct,frames_train,frames_test
+050,LH,29.9,7.8,95.3,92.6,3923,1658
+050,RH,39.3,13.7,88.4,82.3,4032,1826
+051,LH,27.9,8.7,97.6,97.0,4184,1573
+051,RH,42.2,11.5,92.4,88.5,3816,1673
+052,LH,42.8,12.4,93.6,87.7,3985,1758
+052,RH,67.1,16.5,86.1,74.8,4291,2027
