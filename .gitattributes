@@ -1,0 +1,4 @@
+# Files in results/ are produced by the scripts (plots, tables), not written by hand.
+# Marking them "generated" keeps them in the repo but leaves them out of GitHub's
+# "Languages" bar and collapses them in diffs.
+results/** linguist-generated=true
