@@ -1,0 +1,51 @@
+# Ultra-Wide-NeRF (official code) on TUS-REC 051 left arm, 2D mode, +/-35 deg fan.
+# Based on the authors' configs/config_convex.txt (loss, network, regularisation kept);
+# probe geometry from data_uwn/051_LH/uwn_geometry.json (prepare_uwn_data.py).
+expname = uwn_051LH
+
+# Loss (authors' values)
+loss = ssim
+ssim_filter_size = 3
+ssim_lambda = 0.1
+gradient_loss_weight = 0.1
+
+# Network (authors' values)
+netwidth = 256
+i_embed = 6
+multires = 10
+
+save_volume = False
+
+# Probe geometry. World unit = outer radius R = 126.7 mm (see prepare_uwn_data.py):
+# big radius 1000 and scaling 1 make depth = 1 - r_inner/R in these units.
+dataset_type = us
+convex_n_rays = 256
+convex_n_samples = 512
+convex_center_x = 0
+convex_center_y = 0
+convex_fan_angle = 70
+convex_big_radius = 1000
+convex_small_radius = 321.231
+convex_use_compiled_cache = False
+convex_use_compiled_cache_on_the_fly = True
+convex_scaling = 1.0
+
+# 2D mode: every frame is an independent image
+use_convex_mode = True
+full_volume_mode = False
+
+# Multivariate Gaussian cones (the method's contribution). Cone-width factors are
+# OUR CHOICE for this probe: lateral spread ~ half the beam spacing at mid-depth,
+# elevation ~ 0.5 mm, both in R units per unit distance (authors' ICE values do not transfer).
+use_mip = True
+use_elongation = False
+mip_voxel_radius_lateral = 0.01
+mip_voxel_radius_depth = 0.025
+
+# Regularisation and warm-up (authors' values)
+reg = True
+r_lcc_penalty = 0.001
+r_tv_penalty = 0.00001
+r_max_reflection = 0.34
+reflection_smoothness_weight = 0.2
+r_warm_up_it = 10000
