@@ -46,6 +46,7 @@ import time
 import imageio.v2 as imageio
 import numpy as np
 import torch
+from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -56,7 +57,11 @@ from evaluate_ultranerf import score, _gauss_window       # noqa: E402  same met
 H_IMG, W_IMG = 480, 640            # original fan image (rows = depth, cols = lateral)
 CHI2_95 = 7.815                    # chi-square, 3 degrees of freedom, 95% (paper Eq. 13)
 PATCH_SIZES = (9, 17, 25, 33, 49, 65)
-BETA, EPS = 1.0, 1e-6              # diag of L >= 1 -> no Gaussian wider than ~1 unit (20 mm),
+CHUNK_PIXELS = 2_000_000          # patch pixels per chunk (~8 MB per array); lower if GPU memory is short
+L_DIAG_MAX = 200.0                 # cap on l^2 + beta: no blob thinner than ~1/200 unit = 0.1 mm
+L_OFF_MAX = 200.0                  # cap on |off-diagonal L|. Without caps L grew to 84,750 and the
+                                   # run went to NaN at step ~13,700 (blobs shrunk 1.6x again and again)
+BETA, EPS = 1.0, 1e-6            # diag of L >= 1 -> no Gaussian wider than ~1 unit (20 mm),
                                    # and L is always invertible (beta = 1e-3 crashed at step 3177)
 
 
@@ -114,6 +119,27 @@ class Renderer:
                + flat[self.i10] * self.w[2] + flat[self.i11] * self.w[3])
         return out * self.valid
 
+    def _patch(self, P, mu_b, Lb, a_b, c_b, col_b, row_b):
+        """K Gaussians on their P x P pixel patches -> two full-image sums (num, den)."""
+        U, dev = self.U, self.device
+        off = torch.arange(P, device=dev) - P // 2
+        cc = col_b.round().long()[:, None, None] + off[None, None, :]            # [K, 1, P]
+        rr = row_b.round().long()[:, None, None] + off[None, :, None]            # [K, P, 1]
+        inb = (rr >= 0) & (rr < H_IMG) & (cc >= 0) & (cc < W_IMG)                # [K, P, P]
+        dx = (cc.float() * self.sx - self.ax) / U - mu_b[:, 0, None, None]
+        dy = (rr.float() * self.sy - self.ay) / U - mu_b[:, 1, None, None]
+        dz = -mu_b[:, 2, None, None]                                              # pixel lies at z = 0
+        q = (Lb[:, 0, 0, None, None] * dx * dx + Lb[:, 1, 1, None, None] * dy * dy
+             + 2 * Lb[:, 0, 1, None, None] * dx * dy
+             + 2 * dz * (Lb[:, 0, 2, None, None] * dx + Lb[:, 1, 2, None, None] * dy)
+             + Lb[:, 2, 2, None, None] * dz * dz)                                 # squared Mahalanobis
+        wgt = a_b[:, None, None] * torch.exp(-0.5 * q) * (inb & (q <= CHI2_95))
+        flat = (rr.clamp(0, H_IMG - 1) * W_IMG + cc.clamp(0, W_IMG - 1)).expand_as(wgt).reshape(-1)
+        zeros = torch.zeros(H_IMG * W_IMG, device=dev)
+        n_add = zeros.index_add(0, flat, (wgt * c_b[:, None, None]).reshape(-1))
+        d_add = zeros.index_add(0, flat, wgt.reshape(-1))
+        return n_add, d_add
+
     def render(self, cloud, pose_mm, stats=None):
         """One frame. pose_mm [4,4]: fan-apex frame -> world (mm). Returns [512, 256] image."""
         U, dev = self.U, self.device
@@ -148,28 +174,26 @@ class Renderer:
         alpha, colour = cloud.opacity(), cloud.colour()
         num = torch.zeros(H_IMG * W_IMG, device=dev)
         den = torch.zeros(H_IMG * W_IMG, device=dev)
+        if stats is not None:
+            stats["mean_patch"] = float(torch.as_tensor(PATCH_SIZES, device=dev)[bucket].float().mean()) \
+                if idx.numel() else 0.0
 
         # --- 3. THE KEY STEP: evaluate each touching Gaussian in 3D on its pixel patch   Eq. 8
+        # Work in chunks of at most CHUNK_PIXELS patch pixels. During training each chunk is
+        # "gradient-checkpointed": its intermediate arrays are freed after the forward pass and
+        # recomputed during backward, so GPU memory stays small however large the blobs grow.
         for b, P in enumerate(PATCH_SIZES):
-            ib = idx[bucket == b]
-            if ib.numel() == 0:
-                continue
-            off = torch.arange(P, device=dev) - P // 2
-            cc = col0[ib].round().long()[:, None, None] + off[None, None, :]     # [K, 1, P]
-            rr = row0[ib].round().long()[:, None, None] + off[None, :, None]     # [K, P, 1]
-            inb = (rr >= 0) & (rr < H_IMG) & (cc >= 0) & (cc < W_IMG)            # [K, P, P]
-            dx = (cc.float() * self.sx - self.ax) / U - mu_p[ib, 0, None, None]
-            dy = (rr.float() * self.sy - self.ay) / U - mu_p[ib, 1, None, None]
-            dz = -mu_p[ib, 2, None, None]                                         # pixel lies at z = 0
-            Lb = Lam_p[ib]
-            q = (Lb[:, 0, 0, None, None] * dx * dx + Lb[:, 1, 1, None, None] * dy * dy
-                 + 2 * Lb[:, 0, 1, None, None] * dx * dy
-                 + 2 * dz * (Lb[:, 0, 2, None, None] * dx + Lb[:, 1, 2, None, None] * dy)
-                 + Lb[:, 2, 2, None, None] * dz * dz)                             # squared Mahalanobis
-            wgt = alpha[ib, None, None] * torch.exp(-0.5 * q) * (inb & (q <= CHI2_95))
-            flat = (rr.clamp(0, H_IMG - 1) * W_IMG + cc.clamp(0, W_IMG - 1)).expand_as(wgt).reshape(-1)
-            num = num.index_add(0, flat, (wgt * colour[ib, None, None]).reshape(-1))
-            den = den.index_add(0, flat, wgt.reshape(-1))
+            ib_all = idx[bucket == b]
+            step = max(1, CHUNK_PIXELS // (P * P))
+            for s in range(0, ib_all.numel(), step):
+                ib = ib_all[s:s + step]
+                args = (mu_p[ib], Lam_p[ib], alpha[ib], colour[ib], col0[ib], row0[ib])
+                if torch.is_grad_enabled():
+                    n_add, d_add = checkpoint(self._patch, P, *args, use_reentrant=False)
+                else:
+                    n_add, d_add = self._patch(P, *args)
+                num = num + n_add
+                den = den + d_add
 
         # --- 4. combine with the background                              Eq. 6-7
         a_bg = torch.nn.functional.softplus(cloud.bg_a_raw)
@@ -218,6 +242,14 @@ def save_pair(path, pred, real):
 
 
 # ======================================================================== train
+def clamp_L(cloud):
+    """Keep every blob's shape inside safe limits (applied after each update)."""
+    with torch.no_grad():
+        dmax = math.sqrt(L_DIAG_MAX - BETA)
+        cloud.L_raw[:, [0, 2, 5]] = cloud.L_raw[:, [0, 2, 5]].clamp(-dmax, dmax)
+        cloud.L_raw[:, [1, 3, 4]] = cloud.L_raw[:, [1, 3, 4]].clamp(-L_OFF_MAX, L_OFF_MAX)
+
+
 def respawn(cloud, opt, grad_acc, cnt, max_frac=0.02):
     """Fixed-budget densification (OUR choice): move near-transparent Gaussians next to
     the highest-gradient ones; shrink both by 1.6x. Returns how many were moved."""
@@ -230,6 +262,9 @@ def respawn(cloud, opt, grad_acc, cnt, max_frac=0.02):
         dead = dead[torch.argsort(op[dead])]                   # most transparent first
         avg = grad_acc / cnt.clamp(min=1)
         avg[useless] = -1
+        # a blob already near the smallest allowed size cannot be split again
+        diag = cloud.L_raw[:, [0, 2, 5]] ** 2 + BETA
+        avg[(diag * 1.6 > L_DIAG_MAX).any(dim=1)] = -1
         n = int(min(dead.numel(), max_frac * op.numel(), (avg > 0).sum().item()))
         if n == 0:
             return 0
@@ -288,14 +323,17 @@ def train(a):
     grad_acc = torch.zeros(a.n_gauss, device=dev)
     cnt = torch.zeros(a.n_gauss, device=dev)
 
-    start = 0
+    start, moved_total = 0, 0
     if a.resume:
         ck = torch.load(a.resume, map_location=dev)
         cloud.load_state_dict(ck["model"])
         opt.load_state_dict(ck["optimizer"])
         start = ck["step"] + 1
+        moved_total = ck.get("moved_total", 0)
+        print(f"Resumed from {a.resume} at step {start}")
 
-    times, moved_total = [], 0
+    times, bad_steps = [], 0
+    clamp_L(cloud)                               # also makes old checkpoints safe on --resume
     pbar = tqdm(range(start, a.n_iters), initial=start, total=a.n_iters, dynamic_ncols=True)
     for step in pbar:
         t0 = time.time()
@@ -306,22 +344,38 @@ def train(a):
         target = imgs[i].float() / 255.0
         loss, parts = compute_loss(pred.T.contiguous(), target.T.contiguous(), "ssim", 0.75, 7, mask=mask_t)
         opt.zero_grad(set_to_none=True)
+        if not torch.isfinite(loss) or stats["visible"].numel() == 0:
+            bad_steps += 1                       # skip this step instead of corrupting the blobs
+            if bad_steps >= 50:
+                raise RuntimeError(f"50 bad steps in a row at step {step} (loss {loss.item()}, "
+                                   f"visible {stats['visible'].numel()}). Resume from an earlier checkpoint.")
+            continue
+        bad_steps = 0
         loss.backward()
         with torch.no_grad():
             v = stats["visible"]
-            grad_acc[v] += cloud.mu.grad[v].norm(dim=1)
-            cnt[v] += 1
+            if cloud.mu.grad is not None:
+                grad_acc[v] += cloud.mu.grad[v].norm(dim=1)
+                cnt[v] += 1
         opt.step()
+        clamp_L(cloud)
         if a.densify_from <= step <= a.densify_until and step % 100 == 0:
             moved_total += respawn(cloud, opt, grad_acc, cnt)
+            clamp_L(cloud)
         if dev.type == "cuda":
             torch.cuda.synchronize()
         times.append(time.time() - t0)
 
         if step % a.i_print == 0:
             dt = float(np.mean(times[-a.i_print:]))
+            mem = torch.cuda.max_memory_allocated() / 2 ** 30 if dev.type == "cuda" else 0.0
             pbar.set_postfix(loss=f"{loss.item():.4f}", visible=int(stats["visible"].numel()),
+                             patch=f"{stats['mean_patch']:.0f}px", gpu_gb=f"{mem:.1f}",
                              s_per_it=f"{dt:.3f}", eta_h=f"{(a.n_iters - step) * dt / 3600:.2f}")
+        if step > 0 and step % a.i_weights == 0:
+            torch.save({"step": step, "model": cloud.state_dict(), "optimizer": opt.state_dict(),
+                        "moved_total": moved_total, "args": vars(a)},
+                       os.path.join(out, f"ckpt_{step:06d}.pt"))
         if step % a.i_img == 0 or step == a.n_iters - 1:
             with torch.no_grad():
                 vp = rend.render(cloud, poses[i_val])
@@ -330,7 +384,7 @@ def train(a):
             save_pair(os.path.join(out, "val", f"{step:06d}.png"), vp.cpu().numpy(),
                       imgs[i_val].cpu().numpy() / 255.0)
             tqdm.write(f"[step {step}] train {loss.item():.5f}  holdout {vl.item():.5f}  "
-                       f"moved so far {moved_total:,}")
+                       f"moved so far {moved_total:,}  max|L| {cloud.L_raw.abs().max().item():.1f}")
 
     torch.save({"step": a.n_iters - 1, "model": cloud.state_dict(), "optimizer": opt.state_dict(),
                 "args": vars(a)}, os.path.join(out, "ckpt_final.pt"))
@@ -425,6 +479,7 @@ def main():
     p.add_argument("--densify_until", type=int, default=15_000)
     p.add_argument("--i_print", type=int, default=100)
     p.add_argument("--i_img", type=int, default=2000)
+    p.add_argument("--i_weights", type=int, default=2000, help="save a checkpoint every N steps")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
     p.add_argument("--resume", default=None)

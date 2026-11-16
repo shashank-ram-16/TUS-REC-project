@@ -30,7 +30,7 @@ desktop.ini
 .DS_Store
 
 # ---- HTML files
-results/*.html
+*.html
 
 external/
 data_uwn/
